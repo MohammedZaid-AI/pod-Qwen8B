@@ -1,5 +1,7 @@
 import os
 import base64
+import json
+import re
 
 # --------------------------------------------------
 # PADDLE / CPU SETTINGS
@@ -20,6 +22,9 @@ from paddleocr import PaddleOCR
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image, ImageEnhance, ImageOps
+
+# IMPORT OUR DETERMINISTIC CLASSIFIER
+from classifier import classify_pod
 
 
 # --------------------------------------------------
@@ -90,13 +95,11 @@ def run_ocr(image_path):
 
     for page in result:
 
-        # PaddleOCR result object
         data = page.json
 
         if callable(data):
             data = data()
 
-        # Get result dictionary
         res = data.get("res", data)
 
         texts = res.get("rec_texts", [])
@@ -107,7 +110,7 @@ def run_ocr(image_path):
             if not text:
                 continue
 
-            # Ignore very low-confidence OCR
+            # Ignore low-confidence OCR
             if score < 0.50:
                 continue
 
@@ -251,6 +254,11 @@ Do NOT confuse the CN with:
 - Barcode number
 - Date
 
+IMPORTANT:
+If a candidate is explicitly labeled "MANUAL REF NO", do NOT use
+it as the CN unless the document separately identifies the same value
+as CN, CNR, Consignment Number, or Docket Number.
+
 For example:
 
 "CNR : 787786 KHODIYAR CASTECH"
@@ -312,7 +320,6 @@ Do NOT mark true simply because the document contains:
 "Sign & Seal"
 "Consignee Sign. & Seal"
 "Stamp"
-or another printed label.
 
 The physical stamp/seal itself must be visible.
 
@@ -368,7 +375,7 @@ IMPORTANT:
 Do NOT automatically include general Terms & Conditions text
 as remarks.
 
-For example, statements such as:
+For example:
 
 "At Owner Risk."
 "Subject to Delhi Jurisdiction only."
@@ -497,8 +504,6 @@ Do NOT classify these as physical damage:
 - stamps
 - ink marks
 
-IMPORTANT:
-
 Physical damage to the POD paper is different from damage to
 the goods/material.
 
@@ -542,13 +547,17 @@ If an explicitly labeled delivery date is present, normalize it to:
 
 YYYY-MM-DD
 
-Example:
+IMPORTANT:
+Never complete an incomplete or ambiguous year.
 
-20-JUL-2026
+For example:
 
-becomes:
+"20-JUL-202"
 
-2026-07-20
+is NOT sufficient evidence for a complete date.
+
+If the final digit/year cannot be reliably determined from the image,
+return null.
 
 If the delivery date cannot be reliably identified:
 
@@ -585,7 +594,28 @@ Do NOT fail the image merely because it is:
 - affected by normal shadows
 
 ============================================================
-STEP 11 — FINAL CROSS-CHECK
+STEP 11 — CONFIDENCE
+============================================================
+
+Provide a confidence score from 0.0 to 1.0 representing your
+confidence in the extracted evidence.
+
+Use high confidence only when the relevant information is clearly
+visible and supported by the image.
+
+Use lower confidence when:
+
+- OCR is unclear
+- handwriting is difficult to read
+- a checkbox is ambiguous
+- a date is partially obscured
+- multiple candidate identifiers exist
+- image quality limits verification
+
+Do not use confidence to compensate for missing evidence.
+
+============================================================
+STEP 12 — FINAL CROSS-CHECK
 ============================================================
 
 Before generating the JSON, perform a final verification.
@@ -624,6 +654,7 @@ Physical damage:
 Delivery date:
 - Is the date explicitly associated with delivery?
 - Did you accidentally select Pickup/Shipping/Invoice/other date?
+- Is the year complete and actually visible?
 
 OCR:
 - Did you verify important OCR values against the image?
@@ -639,7 +670,6 @@ Return ONLY valid JSON.
 Do not provide explanations.
 Do not provide Markdown.
 Do not use code fences.
-Do not add additional fields.
 Do not add comments.
 
 Use exactly this structure:
@@ -654,9 +684,196 @@ Use exactly this structure:
   "deliveryDate": "YYYY-MM-DD or null",
   "physicalDamage": false,
   "businessDamage": false,
-  "shortage": false
+  "shortage": false,
+  "confidenceScore": 0.95
 }}
 """
+
+
+# --------------------------------------------------
+# EXTRACT JSON FROM QWEN RESPONSE
+# --------------------------------------------------
+
+def parse_qwen_json(response_text):
+
+    if not response_text:
+        raise ValueError("Qwen returned an empty response.")
+
+    text = response_text.strip()
+
+    # Remove Markdown code fences if Qwen accidentally uses them
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    # Try direct JSON parsing
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting the first JSON object
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+
+    if match:
+
+        try:
+            return json.loads(match.group(0))
+
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Could not parse Qwen JSON: {e}"
+            )
+
+    raise ValueError("No JSON object found in Qwen response.")
+
+
+# --------------------------------------------------
+# VALIDATE QWEN EVIDENCE
+# --------------------------------------------------
+
+def validate_evidence(evidence):
+
+    required_fields = [
+        "cnNumber",
+        "hasSignature",
+        "hasStamp",
+        "hasHandwriting",
+        "imageQualityPassed",
+        "remarksText",
+        "deliveryDate",
+        "physicalDamage",
+        "businessDamage",
+        "shortage"
+    ]
+
+    for field in required_fields:
+
+        if field not in evidence:
+
+            raise ValueError(
+                f"Qwen response is missing field: {field}"
+            )
+
+    # Normalize boolean fields
+    boolean_fields = [
+        "hasSignature",
+        "hasStamp",
+        "hasHandwriting",
+        "imageQualityPassed",
+        "physicalDamage",
+        "businessDamage",
+        "shortage"
+    ]
+
+    for field in boolean_fields:
+
+        evidence[field] = bool(
+            evidence[field]
+        )
+
+    # Normalize null-like strings
+    for field in [
+        "cnNumber",
+        "remarksText",
+        "deliveryDate"
+    ]:
+
+        if isinstance(evidence[field], str):
+
+            value = evidence[field].strip()
+
+            if value.lower() in [
+                "null",
+                "none",
+                "n/a",
+                ""
+            ]:
+
+                evidence[field] = None
+
+            else:
+
+                evidence[field] = value
+
+    # Confidence
+    confidence = evidence.get("confidenceScore")
+
+    if confidence is None:
+
+        confidence = 0.0
+
+    try:
+
+        confidence = float(confidence)
+
+    except (TypeError, ValueError):
+
+        confidence = 0.0
+
+    # Keep confidence in valid range
+    confidence = max(
+        0.0,
+        min(1.0, confidence)
+    )
+
+    evidence["confidenceScore"] = confidence
+
+    return evidence
+
+
+# --------------------------------------------------
+# BUILD FINAL ASSESSMENT JSON
+# --------------------------------------------------
+
+def build_final_output(evidence):
+
+    # Run deterministic classification
+    category, category_reason = classify_pod(evidence)
+
+    final_output = {
+
+        "cnNumber": evidence.get("cnNumber"),
+
+        "hasSignature": evidence.get(
+            "hasSignature"
+        ),
+
+        "hasStamp": evidence.get(
+            "hasStamp"
+        ),
+
+        "hasHandwriting": evidence.get(
+            "hasHandwriting"
+        ),
+
+        "imageQualityPassed": evidence.get(
+            "imageQualityPassed"
+        ),
+
+        "remarksText": evidence.get(
+            "remarksText"
+        ),
+
+        "deliveryDate": evidence.get(
+            "deliveryDate"
+        ),
+
+        "categoryReason": category_reason,
+
+        "confidenceScore": evidence.get(
+            "confidenceScore"
+        ),
+
+        "podCategory": category,
+
+        # No configured business limit has been
+        # provided yet, so keep this false.
+        "limit_exceed": False
+    }
+
+    return final_output
+
 
 # --------------------------------------------------
 # INPUT IMAGE
@@ -669,35 +886,45 @@ image_path = "images/pod5.jpg"
 # PREPROCESS IMAGE
 # --------------------------------------------------
 
-processed_image_path = preprocess_image(image_path)
+processed_image_path = preprocess_image(
+    image_path
+)
 
 
 # --------------------------------------------------
 # RUN OCR
 # --------------------------------------------------
 
-ocr_text = run_ocr(processed_image_path)
+ocr_text = run_ocr(
+    processed_image_path
+)
 
 
 # --------------------------------------------------
 # BUILD QWEN PROMPT
 # --------------------------------------------------
 
-prompt = build_prompt(ocr_text)
+prompt = build_prompt(
+    ocr_text
+)
 
 
 # --------------------------------------------------
 # IMAGE → BASE64
 # --------------------------------------------------
 
-image_url = image_to_data_url(processed_image_path)
+image_url = image_to_data_url(
+    processed_image_path
+)
 
 
 # --------------------------------------------------
 # SEND IMAGE + OCR TO QWEN 3 VL 8B
 # --------------------------------------------------
 
-print("\n========== SENDING TO QWEN 3 VL 8B ==========\n")
+print(
+    "\n========== SENDING TO QWEN 3 VL 8B ==========\n"
+)
 
 response = client.chat.completions.create(
 
@@ -706,6 +933,7 @@ response = client.chat.completions.create(
     messages=[
         {
             "role": "user",
+
             "content": [
 
                 {
@@ -715,6 +943,7 @@ response = client.chat.completions.create(
 
                 {
                     "type": "image_url",
+
                     "image_url": {
                         "url": image_url
                     }
@@ -727,11 +956,93 @@ response = client.chat.completions.create(
 
 
 # --------------------------------------------------
-# OUTPUT
+# QWEN RAW OUTPUT
 # --------------------------------------------------
 
-print("\n========== QWEN 3 VL 8B OUTPUT ==========\n")
+qwen_raw = response.choices[0].message.content
 
-print(response.choices[0].message.content)
+print(
+    "\n========== QWEN 3 VL 8B OUTPUT ==========\n"
+)
 
-print("\n===========================================\n")
+print(qwen_raw)
+
+print(
+    "\n===========================================\n"
+)
+
+
+# --------------------------------------------------
+# PARSE QWEN JSON
+# --------------------------------------------------
+
+try:
+
+    evidence = parse_qwen_json(
+        qwen_raw
+    )
+
+    evidence = validate_evidence(
+        evidence
+    )
+
+except Exception as e:
+
+    print(
+        "\n========== QWEN JSON ERROR ==========\n"
+    )
+
+    print(e)
+
+    print(
+        "\nThe final classification was NOT generated."
+    )
+
+    raise
+
+
+# --------------------------------------------------
+# PRINT EVIDENCE
+# --------------------------------------------------
+
+print(
+    "\n========== VALIDATED EVIDENCE ==========\n"
+)
+
+print(
+    json.dumps(
+        evidence,
+        indent=2,
+        ensure_ascii=False
+    )
+)
+
+
+# --------------------------------------------------
+# CLASSIFICATION
+# --------------------------------------------------
+
+final_output = build_final_output(
+    evidence
+)
+
+
+# --------------------------------------------------
+# FINAL ASSESSMENT JSON
+# --------------------------------------------------
+
+print(
+    "\n========== FINAL POD CLASSIFICATION ==========\n"
+)
+
+print(
+    json.dumps(
+        final_output,
+        indent=2,
+        ensure_ascii=False
+    )
+)
+
+print(
+    "\n===============================================\n"
+)
